@@ -1,0 +1,286 @@
+---
+title: "Using Digital Data to Predict Zika"
+author: "Sarah McGough"
+date: "3/1/2018"
+output: github_document
+fig_width: 5
+fig_height: 4
+
+---
+```{r, message=F, warning=F}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(glmnet)
+library(lubridate)
+```
+
+### Introduction
+It has been shown that linear combinations of key Google search phrases can be leveraged to predict the incidence of diseases such as influenza (Yang et al 2015) and dengue fever (Yang et al 2017). Let's see if we can do the same for Zika virus during the 2016 Latin American outbreak!
+
+To give you an idea how this works, we'll try the method on one test country, Colombia.
+
+We'll first load a pre-cleaned file that contains: 
+
+1. Date- start day of the week of interest
+
+2. Cases- the number of cases suspected to have occurred during this week
+
+3. {26 search terms spelled exactly as they would have been entered into Google by a user}- Google search fraction
+
+4. "twitter", a variable denoting the combined Twitter hashtag frequency for Colombia (by week) of the terms "microcephaly," "microcefalia," and "zika"
+
+5. "healthmap", a variable indicating the reported number of cases by week as digitally media-sourced by the organization HealthMap. 
+
+```{r}
+setwd("/Users/sarah/Documents/Harvard/Year 4/R tutorials/Zika/")
+case_data <- read.csv("Zika_Colombia_cleaned.csv")
+head(case_data)
+case_data$date <- mdy(case_data$date) # Format the date properly
+```
+
+Since we are focused on *predicting* cases out-of-sample, we do *not* want our data to exhibit what we call "forward-looking bias." This means that the list of relevant search terms was collected *prior* to the week in which predictions were first generated. In other words, we gathered the terms based on their relevance during the training period exclusively, which we defined to be the first 17 weeks of the epidemic.
+
+(An aside: prediction modeling generally divides the dataset in two halves, the first for training on the observed outcome, and the second for producing out-of-sample predictions without "seeing" the observed outcome. We will be training our model on a one-week-expanding training window, which means that each prediction incorporates the most recent information, up until the week of the prediction). 
+
+Let's take a look at how these Google search terms, Twitter hashtags, and HealthMap-reported cases - which we will use as our *predictors* for this model - relate to our outcome of interest: weekly cases. 
+
+To give an example of how to do this for a suspected linear relationship, we'll examine the Pearson's correlation between weekly cases and one predictor of interest, the Google search term "sintomas del zika."
+
+```{r}
+cor(case_data$cases[1:20], case_data$sintomas.del.zika[1:20]) # in the training weeks
+```
+```{r}
+cor(case_data$cases, case_data$sintomas.del.zika) # in full dataset
+```
+
+We can try a square-root transform to see if this improves the relationship.
+```{r}
+cor(case_data$cases, sqrt(case_data$sintomas.del.zika)) # in full dataset
+```
+
+Let's plot the relationship between the search term "Sintomas del Zika" and cases for each week of the epidemic.
+```{r echo=F, fig.width=6, fig.height=3}
+par(mfrow=c(1,3))
+# Epidemic curve vs. search volume
+plot(as.Date(case_data$date), case_data$cases, type="l", col="black", xlab="Date", ylab=NA, xaxt="n",xaxs="i")
+par(new=T)
+plot(as.Date(case_data$date), case_data$sintomas.del.zika, type="l", col="blue", axes=F, xlab=NA, ylab=NA, xaxt="n",xaxs="i")
+legend(as.Date(case_data$date)[1],2500, c("Cases","Search Volume"), lty=c(1,1),col=c("black","blue"), cex=0.5)
+
+# Correlation
+plot(case_data$sintomas.del.zika, case_data$cases, pch=16, ylab="Cases",xlab="term: Sintomas del Zika")
+abline(lm(case_data$cases~case_data$sintomas.del.zika), col="blue")
+
+# Correlation with square-root transform
+plot(sqrt(case_data$sintomas.del.zika), case_data$cases, pch=16, ylab="Cases",xlab="term: Sintomas del Zika")
+abline(lm(case_data$cases~sqrt(case_data$sintomas.del.zika)), col="blue")
+```
+
+What does the relationship look like to you?
+
+### The Model
+We will build a simple but powerful linear regression model (an example of a *supervised learning* model in machine learning lingo) that takes into account 1) the Zika-related Google search terms and 2) autoregressive case counts (it is good to make the model keep track of how many cases were realized in the few weeks prior). The relationship between Zika-related search terms and reported Zika cases will be explored synchronously - per the good synchronous relationship we observed in the correlations - which suits our paper's goals of producing good near-real-time predictions weeks ahead of the release of official Ministry of Health reports. In order to produce further-ahead real-time predictions, we would lag the relationship between searches and cases by some week(s), at the sacrifice of some accuracy.
+
+Some features of the model:
+
+* Dynamic variable transformation
+
+* Automatic feature selection (L1 regularization)
+
+* Out-of-sample predictions of new Zika cases (up to 3 weeks ahead) on a 1-week expanding training window
+
+What this means is that our model:
+
+* Assesses and chooses the best linear fit of the predictors based on a series of linear data transformations
+
+* Retains only the most important predictors each week, and discards the rest as noise (LASSO)
+
+* Continually updates each week with the most current information, to produce a prediction for the following week
+
+For this tutorial, we will look at predictions generated 1 week ahead. 
+
+First, some data prep: we will lag the case data by 1 week (giving us, for each week, a measure of last week's case count), and remove the first week of the data so that we can observe only complete rows of data (the first week contains an NA for the lag term). We'll then turn the predictors into a matrix of X covariates (Google predictors + lag terms) and a matrix of the Y outcome (cases).
+```{r}
+# Create autoregressive terms: 1-3 week lag
+case_data$lag_1 <- lag(case_data$cases, 1)
+
+head(case_data) # note the NAs due to lagging the data
+
+# We'll filter to observable data (no NAs due to lags)
+case_data <- case_data %>% filter(date>"2015-08-09") # start 1 week in
+
+X_matrix <- as.matrix(case_data[,c(3:ncol(case_data))]) # Choose only the predictors (which start in column 3)
+Y_matrix <- as.matrix(case_data[,2])
+```
+
+Now, we can run the model. We'll start with a model that uses only digital data sources (Google, Twitter, and HealthMap).
+```{r}
+predictions_1wk <- NULL
+coefficients <- NULL
+
+n <- length(case_data$cases)
+k <- 17
+
+for(i in k:(n-1)) {
+  sub_X <- X_matrix[1:(i+1),1:(ncol(X_matrix)-1)]
+  sub_Y <- Y_matrix[1:(i+1),]
+ 
+  #####################################
+  ######## Data transformation ########
+  #####################################
+  transforms <- cbind(apply(sub_X[1:i,], 2, cor, x = sub_Y[1:i]),
+              apply(sqrt(sub_X[1:i,]), 2, cor, x = sub_Y[1:i]),
+                    apply(log(sub_X[1:i,]), 2, cor, x = sub_Y[1:i]))
+  
+  transforms[is.na(transforms)] <- 0
+  
+  sub_X[,which(max.col(transforms, 'first')==2,arr.ind=T)] <- apply(sub_X[,which(max.col(transforms, 'first')==2,arr.ind=T)], 2, function(x) sqrt(x))
+  
+  if(length(which(max.col(transforms, 'first')==3,arr.ind=T))>1){
+    sub_X[,which(max.col(transforms, 'first')==3,arr.ind=T)] <- apply(sub_X[,which(max.col(transforms, 'first')==3,arr.ind=T)], 2, function(x) log(x))
+  } else {
+    sub_X[,which(max.col(transforms, 'first')==3,arr.ind=T)] <- log(sub_X[,which(max.col(transforms, 'first')==3,arr.ind=T)])
+  }
+
+  #####################################
+  ###### 1 week ahead prediction ######
+  #####################################
+  
+  X_train <- sub_X[1:i,]
+  Y_train <- sub_Y[1:i]
+  fit <- glmnet(X_train, Y_train, family="gaussian")
+  set.seed(14)
+  cvfit <- cv.glmnet(X_train, Y_train, family = "gaussian",nfolds=5)
+  opt.lam <- cvfit$lambda.min 
+  
+  if (i==(k)){ # get fitted values for the training period
+    predictions_1wk <- data.frame(rbind(predictions_1wk, predict(fit, newx=X_train, type="response",s=opt.lam)))
+  }
+  
+  X_test <- sub_X[(i):(i+1),] # the test set
+  predictions_1wk <- data.frame(rbind(predictions_1wk,predict(fit, newx=X_test, type="response",s=opt.lam)[2])) # predict next week
+  coefficients <- cbind(coefficients,coef(cvfit, s=opt.lam))
+  
+} 
+```
+
+All done! Time to look at your predictions
+
+```{r}
+names(predictions_1wk)[1] <- "predictions"
+predictions_1wk$dates <- case_data[1:(n),1]
+print(predictions_1wk)
+```
+
+We can also plot our predictions against the true case counts by week.
+```{r}
+plot(case_data$date, case_data$cases, type="l", axes=T, xlab=NA, ylab=NA, col="black", ylim=c(0,6000),xaxs="i", yaxs="i", lwd=4, main="1-Week-Ahead Predicted Cases of Zika in Colombia")
+par(new=T)
+plot(as.Date(predictions_1wk$dates), predictions_1wk$predictions, type="l", axes=F, xlab=NA, ylab=NA, col="green", lwd=2,xaxs="i", yaxs="i",ylim=c(0,6000),xlim=c(as.numeric(as.Date(case_data$date[1])),(as.numeric(as.Date(case_data$date[n])))))
+```
+
+**So: these predictions are not the greatest.** As it turns out, we could probably improve the number and nature of Google search terms included, but what we found in our paper was that *exclusively* using Google & other Internet-based data sources is better when predicting multiple weeks into the future (i.e. our 2-3 week forecasts). But for predictions only 1 week in advance, we suspect that autoregressive information (i.e. knowing how many cases occurred last year) could be a good way to calibrate things. We'll add in the autoregressive data to see if this improves the model forecasts.
+
+```{r}
+predictions_1wk_ARGO <- NULL
+coefficients_ARGO <- NULL
+
+n <- length(case_data$cases)
+k <- 17
+
+for(i in k:(n-1)) {
+  sub_X <- X_matrix[1:(i+1),]
+  sub_Y <- Y_matrix[1:(i+1),]
+ 
+  #####################################
+  ######## Data transformation ########
+  #####################################
+  transforms <- cbind(apply(sub_X[1:i,], 2, cor, x = sub_Y[1:i]),
+              apply(sqrt(sub_X[1:i,]), 2, cor, x = sub_Y[1:i]),
+                    apply(log(sub_X[1:i,]), 2, cor, x = sub_Y[1:i]))
+  
+  transforms[is.na(transforms)] <- 0
+  
+  sub_X[,which(max.col(transforms, 'first')==2,arr.ind=T)] <- apply(sub_X[,which(max.col(transforms, 'first')==2,arr.ind=T)], 2, function(x) sqrt(x))
+  
+  if(length(which(max.col(transforms, 'first')==3,arr.ind=T))>1){
+    sub_X[,which(max.col(transforms, 'first')==3,arr.ind=T)] <- apply(sub_X[,which(max.col(transforms, 'first')==3,arr.ind=T)], 2, function(x) log(x))
+  } else {
+    sub_X[,which(max.col(transforms, 'first')==3,arr.ind=T)] <- log(sub_X[,which(max.col(transforms, 'first')==3,arr.ind=T)])
+  }
+
+  #####################################
+  ###### 1 week ahead prediction ######
+  #####################################
+  
+  X_train <- sub_X[1:i,]
+  Y_train <- sub_Y[1:i]
+  fit <- glmnet(X_train, Y_train, family="gaussian")
+  set.seed(14)
+  cvfit <- cv.glmnet(X_train, Y_train, family = "gaussian",nfolds=5)
+  opt.lam <- cvfit$lambda.min 
+  
+  if (i==(k)){ # get fitted values for the training period
+    predictions_1wk_ARGO <- data.frame(rbind(predictions_1wk_ARGO, predict(fit, newx=X_train, type="response",s=opt.lam)))
+  }
+  
+  X_test <- sub_X[(i):(i+1),] # the test set
+  predictions_1wk_ARGO <- data.frame(rbind(predictions_1wk_ARGO,predict(fit, newx=X_test, type="response",s=opt.lam)[2])) # predict next week
+  coefficients_ARGO <- cbind(coefficients_ARGO,coef(cvfit, s=opt.lam))
+  
+}  
+
+# Some cleaning
+names(predictions_1wk_ARGO)[1] <- "predictions"
+predictions_1wk_ARGO$dates <- case_data[1:(n),1]
+print(predictions_1wk_ARGO)
+```
+
+Let's plot our two models in the same figure, for comparability.
+```{r}
+# Internet data only
+plot(case_data$date, case_data$cases, type="l", axes=T, xlab=NA, ylab=NA, col="black", ylim=c(0,6000),xaxs="i", yaxs="i", lwd=4, main="1-Week-Ahead Predicted Cases of Zika in Colombia")
+par(new=T)
+plot(as.Date(predictions_1wk$dates), predictions_1wk$predictions, type="l", axes=F, xlab=NA, ylab=NA, col="green", lwd=3,xaxs="i", yaxs="i",ylim=c(0,6000),xlim=c(as.numeric(as.Date(case_data$date[1])),(as.numeric(as.Date(case_data$date[n])))))
+
+par(new=T)
+# Internet + Autoregressive (our "ARGO" model)
+plot(as.Date(predictions_1wk_ARGO$dates), predictions_1wk_ARGO$predictions, type="l", axes=F, xlab=NA, ylab=NA, col="red", lwd=3,xaxs="i", yaxs="i",ylim=c(0,6000),xlim=c(as.numeric(as.Date(case_data$date[1])),(as.numeric(as.Date(case_data$date[n])))))
+legend(as.Date(case_data$date)[1],5000, c("Truth","Internet Only","AR+Internet"), lty=c(1,1),col=c("black","green","red"), cex=0.5)
+```
+
+That looks better!
+
+### Assessing Prediction Accuracy
+There are a few metrics one can use to evaluate the predictive accuracy of the model. We'll use the Root Mean Square Error (RMSE), the Relative Root Mean Square Error (rRMSE), and the correlation between predictions and observed cases (the black line). Can you figure out what the equations for these metrics are based on the code? Note that we want to compute these measures using the out-of-sample predictions ONLY. 
+
+We'll bind the true number of cases per week to our predictions_1wk data frame and compute the evaluation metrics within the test set.
+```{r}
+# Add observed cases
+predictions_1wk$cases <- case_data[,2]
+predictions_1wk_ARGO$cases <- case_data[,2]
+
+# RMSE
+rmse_test_1wk <- sqrt(mean((predictions_1wk$cases[(k+1):nrow(predictions_1wk)] - predictions_1wk$predictions[(k+1):nrow(predictions_1wk)])^2))
+
+rmse_test_1wk_ARGO <- sqrt(mean((predictions_1wk_ARGO$cases[(k+1):nrow(predictions_1wk_ARGO)] - predictions_1wk_ARGO$predictions[(k+1):nrow(predictions_1wk_ARGO)])^2))
+
+print(c(rmse_test_1wk,rmse_test_1wk_ARGO))
+
+# rRMSE
+rRMSE_1wk <- 100*(sqrt(mean(((predictions_1wk$cases[(k+1):nrow(predictions_1wk)] - predictions_1wk$predictions[(k+1):nrow(predictions_1wk)])^2)/(predictions_1wk$cases[(k+1):nrow(predictions_1wk)])^2)))
+
+rRMSE_1wk_ARGO <- 100*(sqrt(mean(((predictions_1wk_ARGO$cases[(k+1):nrow(predictions_1wk_ARGO)] - predictions_1wk_ARGO$predictions[(k+1):nrow(predictions_1wk_ARGO)])^2)/(predictions_1wk_ARGO$cases[(k+1):nrow(predictions_1wk_ARGO)])^2)))
+
+print(c(rRMSE_1wk, rRMSE_1wk_ARGO))
+
+# Correlation
+corr_1wk <- cor(predictions_1wk$cases[(k+1):nrow(predictions_1wk)], predictions_1wk$predictions[(k+1):nrow(predictions_1wk)])
+
+corr_1wk_ARGO <- cor(predictions_1wk_ARGO$cases[(k+1):nrow(predictions_1wk)], predictions_1wk_ARGO$predictions[(k+1):nrow(predictions_1wk)])
+
+print(c(corr_1wk, corr_1wk_ARGO))
+```
+
+To see how we did this for 2 other prediction horizons (2- and 3-weeks ahead) and in 4 other countries, check out our paper *Forecasting Zika Incidence in the 2016 Latin America Outbreak Combining Traditional Disease Surveillance with Search, Social Media, and News Report Data* at http://journals.plos.org/plosntds/article?id=10.1371/journal.pntd.0005295. 
